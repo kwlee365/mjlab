@@ -1,4 +1,4 @@
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import torch
@@ -10,6 +10,7 @@ from mjlab.entity import Entity
 from mjlab.scene import Scene
 from mjlab.sim.sim import Simulation, SimulationCfg
 from mjlab.tasks.tracking.config.g1.env_cfgs import unitree_g1_flat_tracking_env_cfg
+from mjlab.tasks.tracking.config.kapex.env_cfgs import kapex_flat_tracking_env_cfg
 from mjlab.utils.lab_api.math import (
   axis_angle_from_quat,
   quat_conjugate,
@@ -18,6 +19,85 @@ from mjlab.utils.lab_api.math import (
 )
 from mjlab.viewer.offscreen_renderer import OffscreenRenderer
 from mjlab.viewer.viewer_config import ViewerConfig
+
+# Joint order must match the CSV column order (base pos, base quat xyzw, then
+# joint angles). Each robot's retargeted CSV uses its own joint ordering.
+G1_JOINT_NAMES = (
+  "left_hip_pitch_joint",
+  "left_hip_roll_joint",
+  "left_hip_yaw_joint",
+  "left_knee_joint",
+  "left_ankle_pitch_joint",
+  "left_ankle_roll_joint",
+  "right_hip_pitch_joint",
+  "right_hip_roll_joint",
+  "right_hip_yaw_joint",
+  "right_knee_joint",
+  "right_ankle_pitch_joint",
+  "right_ankle_roll_joint",
+  "waist_yaw_joint",
+  "waist_roll_joint",
+  "waist_pitch_joint",
+  "left_shoulder_pitch_joint",
+  "left_shoulder_roll_joint",
+  "left_shoulder_yaw_joint",
+  "left_elbow_joint",
+  "left_wrist_roll_joint",
+  "left_wrist_pitch_joint",
+  "left_wrist_yaw_joint",
+  "right_shoulder_pitch_joint",
+  "right_shoulder_roll_joint",
+  "right_shoulder_yaw_joint",
+  "right_elbow_joint",
+  "right_wrist_roll_joint",
+  "right_wrist_pitch_joint",
+  "right_wrist_yaw_joint",
+)
+
+# KAPEX order matches COLMO's retargeting xml (body-tree order): legs (incl. toe),
+# waist, head, then arms. Toe columns stay here to keep CSV column alignment; if
+# the model has toes fixed, run_sim drops those columns by joint name.
+KAPEX_JOINT_NAMES = (
+  "left_hip_yaw_joint",
+  "left_hip_roll_joint",
+  "left_hip_pitch_joint",
+  "left_knee_joint",
+  "left_ankle_pitch_joint",
+  "left_ankle_roll_joint",
+  "left_toe_pitch_joint",
+  "right_hip_yaw_joint",
+  "right_hip_roll_joint",
+  "right_hip_pitch_joint",
+  "right_knee_joint",
+  "right_ankle_pitch_joint",
+  "right_ankle_roll_joint",
+  "right_toe_pitch_joint",
+  "waist_roll_joint",
+  "waist_yaw_joint",
+  "waist_pitch_joint",
+  "head_pitch_joint",
+  "head_yaw_joint",
+  "left_shoulder_pitch_joint",
+  "left_shoulder_roll_joint",
+  "left_shoulder_yaw_joint",
+  "left_elbow_joint",
+  "left_wrist_yaw_joint",
+  "left_wrist_roll_joint",
+  "left_wrist_pitch_joint",
+  "right_shoulder_pitch_joint",
+  "right_shoulder_roll_joint",
+  "right_shoulder_yaw_joint",
+  "right_elbow_joint",
+  "right_wrist_yaw_joint",
+  "right_wrist_roll_joint",
+  "right_wrist_pitch_joint",
+)
+
+# Maps --robot to (scene config factory, joint order).
+_ROBOTS = {
+  "g1": (unitree_g1_flat_tracking_env_cfg, G1_JOINT_NAMES),
+  "kapex": (kapex_flat_tracking_env_cfg, KAPEX_JOINT_NAMES),
+}
 
 
 class MotionLoader:
@@ -201,7 +281,28 @@ def run_sim(
   )
 
   robot: Entity = scene["robot"]
-  robot_joint_indexes = robot.find_joints(joint_names, preserve_order=True)[0]
+  # The CSV may contain joints that are fixed (not actuated) in this model, e.g.
+  # KAPEX toes. Keep only the CSV columns whose joint exists in the robot; the
+  # rest are dropped at replay. For robots whose CSV matches 1:1 (e.g. G1) this
+  # is a no-op.
+  robot_joint_name_set = set(robot.joint_names)
+  kept_cols = [i for i, n in enumerate(joint_names) if n in robot_joint_name_set]
+  kept_names = [joint_names[i] for i in kept_cols]
+
+  # Fail loud if any actuated robot joint has no CSV column: it would otherwise be
+  # silently frozen at its default pose in the produced motion.
+  missing = [n for n in robot.joint_names if n not in set(kept_names)]
+  if missing:
+    raise ValueError(
+      f"CSV joint list has no column for robot joints {missing}; they would be "
+      "frozen. Check the joint order/names for this robot."
+    )
+  dropped = [n for i, n in enumerate(joint_names) if i not in set(kept_cols)]
+  if dropped:
+    print(f"[INFO] Ignoring CSV columns for non-actuated joints: {dropped}")
+
+  robot_joint_indexes = robot.find_joints(kept_names, preserve_order=True)[0]
+  motion_col_indexes = torch.tensor(kept_cols, dtype=torch.long, device=sim.device)
 
   log: dict[str, Any] = {
     "fps": [output_fps],
@@ -254,8 +355,8 @@ def run_sim(
 
     joint_pos = robot.data.default_joint_pos.clone()
     joint_vel = robot.data.default_joint_vel.clone()
-    joint_pos[:, robot_joint_indexes] = motion_dof_pos
-    joint_vel[:, robot_joint_indexes] = motion_dof_vel
+    joint_pos[:, robot_joint_indexes] = motion_dof_pos[:, motion_col_indexes]
+    joint_vel[:, robot_joint_indexes] = motion_dof_vel[:, motion_col_indexes]
     robot.write_joint_state_to_sim(joint_pos, joint_vel)
 
     sim.forward()
@@ -344,6 +445,7 @@ def main(
   device: str = "cuda:0",
   render: bool = False,
   line_range: tuple[int, int] | None = None,
+  robot: Literal["g1", "kapex"] = "g1",
 ):
   """Replay motion from CSV file and output to npz file.
 
@@ -355,15 +457,18 @@ def main(
     device: Device to use.
     render: Whether to render the simulation and save a video.
     line_range: Range of lines to process from the CSV file.
+    robot: Which robot the CSV was retargeted to (selects scene and joint order).
   """
   if device.startswith("cuda") and not torch.cuda.is_available():
     print("[WARNING]: CUDA is not available. Falling back to CPU. This may be slow.")
     device = "cpu"
 
+  scene_cfg_fn, joint_names = _ROBOTS[robot]
+
   sim_cfg = SimulationCfg()
   sim_cfg.mujoco.timestep = 1.0 / output_fps
 
-  scene = Scene(unitree_g1_flat_tracking_env_cfg().scene, device=device)
+  scene = Scene(scene_cfg_fn().scene, device=device)
   model = scene.compile()
 
   sim = Simulation(num_envs=1, cfg=sim_cfg, model=model, device=device)
@@ -391,37 +496,7 @@ def main(
   run_sim(
     sim=sim,
     scene=scene,
-    joint_names=[
-      "left_hip_pitch_joint",
-      "left_hip_roll_joint",
-      "left_hip_yaw_joint",
-      "left_knee_joint",
-      "left_ankle_pitch_joint",
-      "left_ankle_roll_joint",
-      "right_hip_pitch_joint",
-      "right_hip_roll_joint",
-      "right_hip_yaw_joint",
-      "right_knee_joint",
-      "right_ankle_pitch_joint",
-      "right_ankle_roll_joint",
-      "waist_yaw_joint",
-      "waist_roll_joint",
-      "waist_pitch_joint",
-      "left_shoulder_pitch_joint",
-      "left_shoulder_roll_joint",
-      "left_shoulder_yaw_joint",
-      "left_elbow_joint",
-      "left_wrist_roll_joint",
-      "left_wrist_pitch_joint",
-      "left_wrist_yaw_joint",
-      "right_shoulder_pitch_joint",
-      "right_shoulder_roll_joint",
-      "right_shoulder_yaw_joint",
-      "right_elbow_joint",
-      "right_wrist_roll_joint",
-      "right_wrist_pitch_joint",
-      "right_wrist_yaw_joint",
-    ],
+    joint_names=list(joint_names),
     input_fps=input_fps,
     input_file=input_file,
     output_fps=output_fps,
