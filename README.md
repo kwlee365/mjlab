@@ -138,3 +138,10 @@ design and abstractions mjlab builds upon.
 Thanks to the MuJoCo Warp team — especially Erik Frey and Taylor Howell — for
 answering our questions, giving helpful feedback, and implementing features
 based on our requests countless times.
+
+
+## Useful Commands
+
+1. python3 batch_csv_to_npz.py {dataset_dir} --registry colmo
+
+2. uv run python batch_train.py --registry colmo

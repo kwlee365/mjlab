@@ -13,8 +13,9 @@ the run trained on), so no W&B round-trip is needed. Override with
 
 Usage:
   uv run python play_latest.py Mjlab-Tracking-Flat-Unitree-G1
-  uv run python play_latest.py Mjlab-Tracking-Flat-Unitree-G1 --reload-interval-s 1.0
   uv run python play_latest.py Mjlab-Tracking-Flat-Unitree-G1 --run-dir logs/rsl_rl/g1_tracking/2026-07-09_11-35-54
+  # follow a whole batch: auto-switch (and swap the motion) as it moves on
+  uv run python play_latest.py Mjlab-Tracking-Flat-Unitree-G1 --experiment logs/rsl_rl/colmo --device cpu --viewer viser
 """
 
 from __future__ import annotations
@@ -30,7 +31,6 @@ from typing import Literal
 import torch
 import tyro
 
-import mjlab
 from mjlab.envs import ManagerBasedRlEnv
 from mjlab.rl import MjlabOnPolicyRunner, RslRlVecEnvWrapper
 from mjlab.tasks.registry import list_tasks, load_env_cfg, load_rl_cfg, load_runner_cls
@@ -86,32 +86,75 @@ def _resolve_motion_file(run_dir: Path) -> str:
 
 
 class LatestCheckpointPolicy:
-  """Callable policy that hot-reloads the newest checkpoint in ``ckpt_dir``.
+  """Callable policy that hot-reloads the newest checkpoint of the run it follows.
 
   The viewer calls ``policy(obs)`` every control step (see BaseViewer); we
-  throttle the (cheap) directory poll to once per ``interval_s`` and only
-  reload when a newer checkpoint file appears. A checkpoint that is still
-  being written is caught by the try/except and retried on the next poll.
+  throttle the (cheap) directory poll to once per ``interval_s`` and only reload
+  when a newer checkpoint appears. A checkpoint still being written is caught by
+  the try/except and retried next poll.
+
+  If ``experiment_dir`` is given, it also tracks whichever run under that
+  experiment is currently active (newest checkpoint) and, when the active run
+  changes (a batch moving to the next motion), swaps the reference motion in
+  place -- no env/viewer rebuild. All runs must share the same task (obs/action
+  layout), which holds for one robot's tracking runs.
   """
 
   def __init__(
     self,
     runner: MjlabOnPolicyRunner,
-    ckpt_dir: Path,
+    env,
+    run_dir: Path,
     device: str,
     interval_s: float = 2.0,
+    experiment_dir: Path | None = None,
+    is_tracking: bool = True,
   ) -> None:
     self.runner = runner
-    self.ckpt_dir = ckpt_dir
+    self.env = env
+    self.run_dir = run_dir
     self.device = device
     self.interval_s = interval_s
+    self.experiment_dir = experiment_dir
+    self.is_tracking = is_tracking
+    self._current_motion: str | None = None
     self._policy = None
     self._loaded_path: Path | None = None
     self._loaded_mtime: float = -1.0
     self._last_check: float = 0.0
     self._reload(force=True)
     if self._policy is None:
-      raise FileNotFoundError(f"No loadable checkpoint in {ckpt_dir}")
+      raise FileNotFoundError(f"No loadable checkpoint in {run_dir}")
+
+  def _swap_motion(self, motion_file: str) -> None:
+    from mjlab.tasks.tracking.mdp.commands import MotionLoader
+
+    cmd = self.env.unwrapped.command_manager.get_term("motion")
+    cmd.motion = MotionLoader(motion_file, cmd.body_indexes, device=cmd.device)
+    cmd.time_steps.zero_()
+    self.env.reset()
+    self._current_motion = motion_file
+    print(f"[play_latest] motion -> {Path(motion_file).parent.name}", flush=True)
+
+  def _maybe_switch_run(self) -> None:
+    if self.experiment_dir is None:
+      return
+    try:
+      active = _find_active_run_dir(self.experiment_dir)
+    except FileNotFoundError:
+      return
+    if active == self.run_dir:
+      return
+    print(f"[play_latest] active run -> {active.name}", flush=True)
+    self.run_dir = active
+    self._loaded_path = None  # force a checkpoint reload from the new run
+    if self.is_tracking:
+      try:
+        new_motion = _resolve_motion_file(active)
+      except (FileNotFoundError, ValueError):
+        return  # params/env.yaml not written yet; retry next poll
+      if new_motion != self._current_motion and Path(new_motion).exists():
+        self._swap_motion(new_motion)
 
   def _reload(self, force: bool = False) -> None:
     now = time.perf_counter()
@@ -119,7 +162,9 @@ class LatestCheckpointPolicy:
       return
     self._last_check = now
 
-    latest = _latest_checkpoint(self.ckpt_dir)
+    self._maybe_switch_run()
+
+    latest = _latest_checkpoint(self.run_dir)
     if latest is None:
       return
     mtime = latest.stat().st_mtime
@@ -137,7 +182,7 @@ class LatestCheckpointPolicy:
 
     self._loaded_path = latest
     self._loaded_mtime = mtime
-    print(f"[play_latest] now playing: {latest.name}", flush=True)
+    print(f"[play_latest] now playing: {self.run_dir.name}/{latest.name}", flush=True)
 
   def __call__(self, obs: torch.Tensor) -> torch.Tensor:
     self._reload()
@@ -150,11 +195,15 @@ class LatestCheckpointPolicy:
 @dataclass(frozen=True)
 class Config:
   run_dir: str | None = None
-  """Run directory to follow. Defaults to the currently-training run."""
+  """A single run directory to follow. Defaults to the currently-training run."""
+  experiment: str | None = None
+  """Experiment dir (e.g. logs/rsl_rl/colmo) to follow: tracks whichever run is
+  currently training and auto-switches (swapping the motion) when a batch moves
+  on to the next run. Takes precedence over --run-dir."""
   motion_file: str | None = None
   """Reference motion npz. Defaults to the run's params/env.yaml value."""
   reload_interval_s: float = 2.0
-  """How often (seconds) to poll for a newer checkpoint."""
+  """How often (seconds) to poll for a newer checkpoint / run."""
   num_envs: int | None = None
   device: str | None = None
   viewer: Literal["auto", "native", "viser"] = "auto"
@@ -171,13 +220,23 @@ def run(task_id: str, cfg: Config) -> None:
     env_cfg.commands["motion"], MotionCommandCfg
   )
 
-  experiment_dir = (Path("logs") / "rsl_rl" / agent_cfg.experiment_name).resolve()
-  run_dir = (
-    Path(cfg.run_dir).resolve()
-    if cfg.run_dir is not None
-    else _find_active_run_dir(experiment_dir)
-  )
-  print(f"[play_latest] following run: {run_dir}")
+  # Follow an experiment dir (auto-switching runs) or a single run.
+  follow_experiment = cfg.experiment is not None
+  experiment_dir: Path | None = None
+  if follow_experiment:
+    experiment_dir = Path(cfg.experiment).resolve()
+    run_dir = _find_active_run_dir(experiment_dir)
+    print(
+      f"[play_latest] following experiment: {experiment_dir} (active: {run_dir.name})"
+    )
+  elif cfg.run_dir is not None:
+    run_dir = Path(cfg.run_dir).resolve()
+    print(f"[play_latest] following run: {run_dir}")
+  else:
+    run_dir = _find_active_run_dir(
+      (Path("logs") / "rsl_rl" / agent_cfg.experiment_name).resolve()
+    )
+    print(f"[play_latest] following run: {run_dir}")
 
   # Tracking tasks need a reference motion resolved from the run; velocity and
   # other command-driven tasks do not.
@@ -200,7 +259,13 @@ def run(task_id: str, cfg: Config) -> None:
   runner = runner_cls(env, asdict(agent_cfg), device=device)
 
   policy = LatestCheckpointPolicy(
-    runner, run_dir, device, interval_s=cfg.reload_interval_s
+    runner,
+    env,
+    run_dir,
+    device,
+    interval_s=cfg.reload_interval_s,
+    experiment_dir=experiment_dir if follow_experiment else None,
+    is_tracking=is_tracking,
   )
 
   if cfg.viewer == "auto":

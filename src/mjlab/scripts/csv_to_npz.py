@@ -270,6 +270,7 @@ def run_sim(
   output_name,
   render,
   line_range,
+  registry="motions",
   renderer: OffscreenRenderer | None = None,
 ):
   motion = MotionLoader(
@@ -415,9 +416,13 @@ def run_sim(
         COLLECTION = output_name
         run = wandb.init(project="csv_to_npz", name=COLLECTION)
         print(f"[INFO]: Logging motion to wandb: {COLLECTION}")
-        REGISTRY = "motions"
+        REGISTRY = registry
+        # A W&B artifact name can only ever have one type, so scope the source
+        # artifact name by registry; otherwise re-uploading the same motion into
+        # a different registry (different type) collides with the existing name.
+        artifact_name = f"{REGISTRY}_{COLLECTION}"
         logged_artifact = run.log_artifact(
-          artifact_or_path="/tmp/motion.npz", name=COLLECTION, type=REGISTRY
+          artifact_or_path="/tmp/motion.npz", name=artifact_name, type=REGISTRY
         )
         run.link_artifact(
           artifact=logged_artifact,
@@ -446,6 +451,7 @@ def main(
   render: bool = False,
   line_range: tuple[int, int] | None = None,
   robot: Literal["g1", "kapex"] = "g1",
+  registry: str = "motions",
 ):
   """Replay motion from CSV file and output to npz file.
 
@@ -458,6 +464,7 @@ def main(
     render: Whether to render the simulation and save a video.
     line_range: Range of lines to process from the CSV file.
     robot: Which robot the CSV was retargeted to (selects scene and joint order).
+    registry: W&B registry to link the motion into (target wandb-registry-<name>).
   """
   if device.startswith("cuda") and not torch.cuda.is_available():
     print("[WARNING]: CUDA is not available. Falling back to CPU. This may be slow.")
@@ -503,6 +510,7 @@ def main(
     output_name=output_name,
     render=render,
     line_range=line_range,
+    registry=registry,
     renderer=renderer,
   )
 
