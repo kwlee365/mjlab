@@ -39,14 +39,25 @@ def resolve_org_and_motions(registry: str, org: str | None) -> tuple[str, list[s
   for candidate in candidates:
     if candidate is None:
       continue
+    project = f"{candidate}/wandb-registry-{registry}"
     try:
-      colls = api.artifact_collections(
-        project_name=f"{candidate}/wandb-registry-{registry}", type_name=registry
-      )
-      names = sorted(c.name for c in colls)
-      return candidate, names
+      # The artifact type need not equal the registry name (e.g. after a
+      # registry rename the type keeps its original value), so discover the
+      # type(s) present and list collections for each.
+      types = [t.name for t in api.artifact_types(project=project)]
     except Exception as exc:  # noqa: BLE001 - try the next candidate.
       last_err = exc
+      continue
+    names: set[str] = set()
+    for type_name in types:
+      try:
+        for coll in api.artifact_collections(project_name=project, type_name=type_name):
+          names.add(coll.name)
+      except Exception:  # noqa: BLE001 - skip types that fail to enumerate.
+        continue
+    if names:
+      return candidate, sorted(names)
+    last_err = RuntimeError(f"no collections found in {project} (types={types})")
   raise SystemExit(
     f"Could not read registry '{registry}' under {candidates}: {last_err}"
   )
