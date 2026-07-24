@@ -35,29 +35,58 @@ _DESIRED_FRAME_COLORS = ((1.0, 0.5, 0.5), (0.5, 1.0, 0.5), (0.5, 0.5, 1.0))
 
 class MotionLoader:
   def __init__(
-    self, motion_file: str, body_indexes: torch.Tensor, device: str = "cpu"
+    self,
+    motion_files: str | list[str] | tuple[str, ...],
+    body_indexes: torch.Tensor,
+    device: str = "cpu",
   ) -> None:
-    data = np.load(motion_file)
-    self.joint_pos = torch.tensor(data["joint_pos"], dtype=torch.float32, device=device)
-    self.joint_vel = torch.tensor(data["joint_vel"], dtype=torch.float32, device=device)
-    self._body_pos_w = torch.tensor(
-      data["body_pos_w"], dtype=torch.float32, device=device
-    )
-    self._body_quat_w = torch.tensor(
-      data["body_quat_w"], dtype=torch.float32, device=device
-    )
-    self._body_lin_vel_w = torch.tensor(
-      data["body_lin_vel_w"], dtype=torch.float32, device=device
-    )
-    self._body_ang_vel_w = torch.tensor(
-      data["body_ang_vel_w"], dtype=torch.float32, device=device
-    )
+    # Accept one file (single clip) or several (multi-clip). Multiple clips are
+    # concatenated along the frame axis with recorded boundaries; sampling stays
+    # within a single clip per episode (see MotionCommand).
+    if isinstance(motion_files, str):
+      motion_files = [motion_files]
+    else:
+      motion_files = [str(f) for f in motion_files]
+
+    def _load(key: str) -> torch.Tensor:
+      return torch.tensor(data[key], dtype=torch.float32, device=device)
+
+    jp, jv, bpw, bqw, blvw, bavw = [], [], [], [], [], []
+    starts: list[int] = []
+    lengths: list[int] = []
+    cursor = 0
+    for motion_file in motion_files:
+      data = np.load(motion_file)
+      n = int(data["joint_pos"].shape[0])
+      jp.append(_load("joint_pos"))
+      jv.append(_load("joint_vel"))
+      bpw.append(_load("body_pos_w"))
+      bqw.append(_load("body_quat_w"))
+      blvw.append(_load("body_lin_vel_w"))
+      bavw.append(_load("body_ang_vel_w"))
+      starts.append(cursor)
+      lengths.append(n)
+      cursor += n
+
+    self.joint_pos = torch.cat(jp, dim=0)
+    self.joint_vel = torch.cat(jv, dim=0)
+    self._body_pos_w = torch.cat(bpw, dim=0)
+    self._body_quat_w = torch.cat(bqw, dim=0)
+    self._body_lin_vel_w = torch.cat(blvw, dim=0)
+    self._body_ang_vel_w = torch.cat(bavw, dim=0)
     self._body_indexes = body_indexes
     self.body_pos_w = self._body_pos_w[:, self._body_indexes]
     self.body_quat_w = self._body_quat_w[:, self._body_indexes]
     self.body_lin_vel_w = self._body_lin_vel_w[:, self._body_indexes]
     self.body_ang_vel_w = self._body_ang_vel_w[:, self._body_indexes]
     self.time_step_total = self.joint_pos.shape[0]
+
+    # Clip boundaries (single clip -> one span covering the whole motion, so
+    # every downstream computation reduces to the original behavior).
+    self.num_clips = len(motion_files)
+    self.clip_starts = torch.tensor(starts, dtype=torch.long, device=device)
+    self.clip_lengths = torch.tensor(lengths, dtype=torch.long, device=device)
+    self.clip_ends = self.clip_starts + self.clip_lengths  # exclusive
 
 
 class MotionCommand(CommandTerm):
@@ -78,10 +107,13 @@ class MotionCommand(CommandTerm):
       device=self.device,
     )
 
-    self.motion = MotionLoader(
-      self.cfg.motion_file, self.body_indexes, device=self.device
+    motion_files = (
+      list(self.cfg.motion_files) if self.cfg.motion_files else [self.cfg.motion_file]
     )
+    self.motion = MotionLoader(motion_files, self.body_indexes, device=self.device)
     self.time_steps = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+    # Which clip each env is currently tracking (all 0 for single-clip motions).
+    self.clip_ids = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
     self.body_pos_relative_w = torch.zeros(
       self.num_envs, len(cfg.body_names), 3, device=self.device
     )
@@ -317,7 +349,24 @@ class MotionCommand(CommandTerm):
     self.robot.reset(env_ids=env_ids)
 
   def _resample_command(self, env_ids: torch.Tensor):
-    if self.cfg.sampling_mode == "start":
+    if self.motion.num_clips > 1:
+      # Multi-clip: pick a clip per env and start within it. The episode then
+      # stays inside that clip (see _update_command). The adaptive per-frame
+      # curriculum is single-clip only, so it falls back to uniform-in-clip here.
+      self.clip_ids[env_ids] = torch.randint(
+        0, self.motion.num_clips, (len(env_ids),), device=self.device
+      )
+      starts = self.motion.clip_starts[self.clip_ids[env_ids]]
+      lengths = self.motion.clip_lengths[self.clip_ids[env_ids]]
+      if self.cfg.sampling_mode == "start":
+        self.time_steps[env_ids] = starts
+      else:
+        offsets = (
+          torch.rand(len(env_ids), device=self.device) * lengths.float()
+        ).long()
+        offsets = torch.minimum(offsets, lengths - 1)
+        self.time_steps[env_ids] = starts + offsets
+    elif self.cfg.sampling_mode == "start":
       self.time_steps[env_ids] = 0
     elif self.cfg.sampling_mode == "uniform":
       self._uniform_sampling(env_ids)
@@ -406,7 +455,10 @@ class MotionCommand(CommandTerm):
 
   def _update_command(self):
     self.time_steps += 1
-    env_ids = torch.where(self.time_steps >= self.motion.time_step_total)[0]
+    # Wrap at the end of the clip each env is on (for a single clip this is the
+    # end of the whole motion, i.e. the original behavior).
+    clip_ends = self.motion.clip_ends[self.clip_ids]
+    env_ids = torch.where(self.time_steps >= clip_ends)[0]
     if env_ids.numel() > 0:
       self._resample_command(env_ids)
       # _resample_command writes qpos/qvel but does not refresh derived
@@ -416,7 +468,7 @@ class MotionCommand(CommandTerm):
 
     self.update_relative_body_poses()
 
-    if self.cfg.sampling_mode == "adaptive":
+    if self.cfg.sampling_mode == "adaptive" and self.motion.num_clips == 1:
       self.bin_failed_count = (
         self.cfg.adaptive_alpha * self._current_bin_failed
         + (1 - self.cfg.adaptive_alpha) * self.bin_failed_count
@@ -584,7 +636,11 @@ class MotionCommand(CommandTerm):
 
 @dataclass(kw_only=True)
 class MotionCommandCfg(CommandTermCfg):
-  motion_file: str
+  motion_file: str = ""
+  """Single reference motion npz. Ignored if `motion_files` is set."""
+  motion_files: tuple[str, ...] = field(default_factory=tuple)
+  """Multiple reference motion npz files (multi-clip). Each episode samples one
+  clip and stays within it; takes precedence over `motion_file` when non-empty."""
   anchor_body_name: str
   body_names: tuple[str, ...]
   entity_name: str

@@ -71,18 +71,46 @@ def _find_active_run_dir(experiment_dir: Path) -> Path:
   return best[1]
 
 
-def _resolve_motion_file(run_dir: Path) -> str:
-  """Read the reference motion path from the run's dumped env config."""
+def _resolve_motion_files(run_dir: Path) -> list[str]:
+  """Read the reference motion path(s) from the run's dumped env config.
+
+  Handles both single-clip runs (``motion_file:``) and multi-clip cluster runs
+  (``motion_files:`` -- a YAML list, emitted with a ``!!python/tuple`` tag).
+  Returns a list of one or more npz paths.
+  """
   env_yaml = run_dir / "params" / "env.yaml"
   if not env_yaml.exists():
     raise FileNotFoundError(f"{env_yaml} not found; pass --motion-file explicitly.")
-  # Regex rather than a YAML parser: dump_yaml may emit Python-specific tags
-  # that safe_load rejects, and we only need this one scalar.
-  for line in env_yaml.read_text().splitlines():
+  # Regex/line parsing rather than a YAML parser: dump_yaml emits Python-specific
+  # tags (e.g. !!python/tuple) that safe_load rejects; we only need these paths.
+  lines = env_yaml.read_text().splitlines()
+  # Multi-clip first: a `motion_files:` key followed by `- <path>` list items.
+  files: list[str] = []
+  in_block = False
+  for line in lines:
+    if not in_block:
+      if re.match(r"\s*motion_files:\s*(!!.*)?$", line):
+        in_block = True
+      continue
+    stripped = line.strip()
+    if stripped.startswith("- "):
+      files.append(stripped[2:].strip().strip("'\""))
+    elif stripped.startswith("!!"):
+      continue  # a bare tag line before the items
+    else:
+      break  # first non-item line ends the list block
+  if files:
+    return files
+  # Single-clip fallback: a non-empty `motion_file:` scalar.
+  for line in lines:
     m = re.match(r"\s*motion_file:\s*(.+?)\s*$", line)
     if m:
-      return m.group(1).strip().strip("'\"")
-  raise ValueError(f"motion_file not found in {env_yaml}; pass --motion-file.")
+      val = m.group(1).strip().strip("'\"")
+      if val:
+        return [val]
+  raise ValueError(
+    f"no motion_file/motion_files found in {env_yaml}; pass --motion-file."
+  )
 
 
 class LatestCheckpointPolicy:
@@ -117,7 +145,7 @@ class LatestCheckpointPolicy:
     self.interval_s = interval_s
     self.experiment_dir = experiment_dir
     self.is_tracking = is_tracking
-    self._current_motion: str | None = None
+    self._current_motion: tuple[str, ...] | None = None
     self._policy = None
     self._loaded_path: Path | None = None
     self._loaded_mtime: float = -1.0
@@ -126,15 +154,21 @@ class LatestCheckpointPolicy:
     if self._policy is None:
       raise FileNotFoundError(f"No loadable checkpoint in {run_dir}")
 
-  def _swap_motion(self, motion_file: str) -> None:
+  def _swap_motion(self, motion_files: list[str]) -> None:
     from mjlab.tasks.tracking.mdp.commands import MotionLoader
 
     cmd = self.env.unwrapped.command_manager.get_term("motion")
-    cmd.motion = MotionLoader(motion_file, cmd.body_indexes, device=cmd.device)
+    cmd.motion = MotionLoader(motion_files, cmd.body_indexes, device=cmd.device)
     cmd.time_steps.zero_()
+    if hasattr(cmd, "clip_ids"):
+      cmd.clip_ids.zero_()
     self.env.reset()
-    self._current_motion = motion_file
-    print(f"[play_latest] motion -> {Path(motion_file).parent.name}", flush=True)
+    self._current_motion = tuple(motion_files)
+    if len(motion_files) == 1:
+      label = Path(motion_files[0]).parent.name
+    else:
+      label = f"{len(motion_files)} clips"
+    print(f"[play_latest] motion -> {label}", flush=True)
 
   def _maybe_switch_run(self) -> None:
     if self.experiment_dir is None:
@@ -150,11 +184,12 @@ class LatestCheckpointPolicy:
     self._loaded_path = None  # force a checkpoint reload from the new run
     if self.is_tracking:
       try:
-        new_motion = _resolve_motion_file(active)
+        new_motions = _resolve_motion_files(active)
       except (FileNotFoundError, ValueError):
         return  # params/env.yaml not written yet; retry next poll
-      if new_motion != self._current_motion and Path(new_motion).exists():
-        self._swap_motion(new_motion)
+      new_key = tuple(new_motions)
+      if new_key != self._current_motion and all(Path(m).exists() for m in new_motions):
+        self._swap_motion(new_motions)
 
   def _reload(self, force: bool = False) -> None:
     now = time.perf_counter()
@@ -223,7 +258,7 @@ def run(task_id: str, cfg: Config) -> None:
   # Follow an experiment dir (auto-switching runs) or a single run.
   follow_experiment = cfg.experiment is not None
   experiment_dir: Path | None = None
-  if follow_experiment:
+  if cfg.experiment is not None:
     experiment_dir = Path(cfg.experiment).resolve()
     run_dir = _find_active_run_dir(experiment_dir)
     print(
@@ -241,13 +276,22 @@ def run(task_id: str, cfg: Config) -> None:
   # Tracking tasks need a reference motion resolved from the run; velocity and
   # other command-driven tasks do not.
   if is_tracking:
-    motion_file = cfg.motion_file or _resolve_motion_file(run_dir)
-    if not Path(motion_file).exists():
-      raise FileNotFoundError(f"Motion file does not exist: {motion_file}")
+    motion_files = (
+      [cfg.motion_file] if cfg.motion_file else _resolve_motion_files(run_dir)
+    )
+    missing = [m for m in motion_files if not Path(m).exists()]
+    if missing:
+      raise FileNotFoundError(f"Motion file(s) do not exist: {missing}")
     motion_cmd = env_cfg.commands["motion"]
     assert isinstance(motion_cmd, MotionCommandCfg)
-    motion_cmd.motion_file = motion_file
-    print(f"[play_latest] motion: {motion_file}")
+    # motion_files takes precedence in MotionCommand; MotionLoader handles a
+    # single-element list identically to a single motion_file (num_clips == 1).
+    motion_cmd.motion_files = tuple(motion_files)
+    motion_cmd.motion_file = ""
+    if len(motion_files) == 1:
+      print(f"[play_latest] motion: {motion_files[0]}")
+    else:
+      print(f"[play_latest] motion: {len(motion_files)} clips (multi-clip)")
 
   if cfg.num_envs is not None:
     env_cfg.scene.num_envs = cfg.num_envs

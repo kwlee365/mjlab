@@ -144,8 +144,7 @@ based on our requests countless times.
 
 1. python3 batch_csv_to_npz.py {dataset_dir} --registry colmo
 
-2. uv run python batch_train.py --registry colmo
+2. uv run python batch_train_clusters.py --registry colmo_g1
 
-3. uv run python play_latest.py Mjlab-Tracking-Flat-Unitree-G1 \
-  --experiment logs/rsl_rl/colmo \
-  --device cpu --viewer viser
+3. uv run play_latest.py Mjlab-Tracking-Flat-Unitree-G1 --experiment logs/rsl_rl/colmo_g1_clusters --device cpu --viewer viser
+

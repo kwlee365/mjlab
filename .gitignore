@@ -13,7 +13,7 @@ artifacts/
 .venv/
 render_robots.py
 benchmark_results/
-*.csv
+*_subject*.csv
 
 # Documentation outputs.
 **/_build/*
