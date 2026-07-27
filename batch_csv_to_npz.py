@@ -32,7 +32,12 @@ def main() -> None:
   )
   parser.add_argument("--input-fps", type=float, default=30.0)
   parser.add_argument("--output-fps", type=float, default=50.0)
-  parser.add_argument("--robot", default="g1", choices=["g1", "kapex"])
+  parser.add_argument(
+    "--robot",
+    required=True,
+    choices=["g1", "kapex"],
+    help="Robot whose joint order the CSVs use (required; no default).",
+  )
   parser.add_argument(
     "--registry",
     default="motions",

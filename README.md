@@ -142,9 +142,10 @@ based on our requests countless times.
 
 ## Useful Commands
 
-1. python3 batch_csv_to_npz.py {dataset_dir} --registry colmo
 
-2. uv run python batch_train_clusters.py --registry colmo_g1
+1. uv run python batch_csv_to_npz.py <csv_dir> --robot <robot> --registry colmo_<robot>
 
-3. uv run play_latest.py Mjlab-Tracking-Flat-Unitree-G1 --experiment logs/rsl_rl/colmo_g1_clusters --device cpu --viewer viser
+2. uv run python batch_train_clusters.py --robot <robot> --registry colmo_<robot> 
+
+3. uv run play_latest.py Mjlab-Tracking-Flat-<robot>  --experiment logs/rsl_rl/colmo_<robot>_clusters --device cpu --viewer viser
 

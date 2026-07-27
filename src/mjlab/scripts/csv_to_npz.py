@@ -54,9 +54,9 @@ G1_JOINT_NAMES = (
   "right_wrist_yaw_joint",
 )
 
-# KAPEX order matches COLMO's retargeting xml (body-tree order): legs (incl. toe),
-# waist, head, then arms. Toe columns stay here to keep CSV column alignment; if
-# the model has toes fixed, run_sim drops those columns by joint name.
+# KAPEX order matches COLMO's retargeting xml (body-tree order): legs, waist, head,
+# then arms. The toes are fixed (welded) in the model, so COLMO retargets 31 DOF
+# without the toe joints and the CSV has no toe columns.
 KAPEX_JOINT_NAMES = (
   "left_hip_yaw_joint",
   "left_hip_roll_joint",
@@ -64,14 +64,12 @@ KAPEX_JOINT_NAMES = (
   "left_knee_joint",
   "left_ankle_pitch_joint",
   "left_ankle_roll_joint",
-  "left_toe_pitch_joint",
   "right_hip_yaw_joint",
   "right_hip_roll_joint",
   "right_hip_pitch_joint",
   "right_knee_joint",
   "right_ankle_pitch_joint",
   "right_ankle_roll_joint",
-  "right_toe_pitch_joint",
   "waist_roll_joint",
   "waist_yaw_joint",
   "waist_pitch_joint",
@@ -282,10 +280,9 @@ def run_sim(
   )
 
   robot: Entity = scene["robot"]
-  # The CSV may contain joints that are fixed (not actuated) in this model, e.g.
-  # KAPEX toes. Keep only the CSV columns whose joint exists in the robot; the
-  # rest are dropped at replay. For robots whose CSV matches 1:1 (e.g. G1) this
-  # is a no-op.
+  # Keep only the CSV columns whose joint exists in this model; any extra columns
+  # are dropped at replay. When the CSV joint list matches the model 1:1 (as for
+  # G1 and KAPEX) this is a no-op safety net.
   robot_joint_name_set = set(robot.joint_names)
   kept_cols = [i for i, n in enumerate(joint_names) if n in robot_joint_name_set]
   kept_names = [joint_names[i] for i in kept_cols]

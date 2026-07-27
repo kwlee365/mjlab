@@ -29,6 +29,12 @@ import sys
 from collections import Counter, OrderedDict
 from pathlib import Path
 
+# Tracking task id per robot; --robot selects one of these.
+ROBOT_TASKS = {
+  "g1": "Mjlab-Tracking-Flat-Unitree-G1",
+  "kapex": "Mjlab-Tracking-Flat-Kapex",
+}
+
 
 def read_clusters(csv_path: Path) -> "OrderedDict[int, list[tuple[str, str]]]":
   clusters: OrderedDict[int, list[tuple[str, str]]] = OrderedDict()
@@ -69,7 +75,17 @@ def main() -> None:
     help="Cluster-assignment CSV (default: alongside this script, so it works "
     "regardless of the current working directory or where the repo is deployed).",
   )
-  parser.add_argument("--task", default="Mjlab-Tracking-Flat-Unitree-G1")
+  parser.add_argument(
+    "--robot",
+    required=True,
+    choices=sorted(ROBOT_TASKS),
+    help="Robot to train (required; no default). Selects the tracking task.",
+  )
+  parser.add_argument(
+    "--task",
+    default=None,
+    help="Override the tracking task id (default: derived from --robot).",
+  )
   parser.add_argument("--num-envs", type=int, default=4096)
   parser.add_argument("--max-iterations", type=int, default=None)
   parser.add_argument(
@@ -87,6 +103,7 @@ def main() -> None:
   )
   parser.add_argument("--dry-run", action="store_true")
   args = parser.parse_args()
+  task = args.task or ROBOT_TASKS[args.robot]
 
   import wandb
 
@@ -137,7 +154,7 @@ def main() -> None:
       "uv",
       "run",
       "train",
-      args.task,
+      task,
       "--env.commands.motion.motion-files",
       # mjlab's TYRO_FLAGS parse collections as Python literals
       # (`--flag (a, b, c)`), so pass the file list as one literal-tuple string
