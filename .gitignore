@@ -14,7 +14,9 @@ artifacts/
 render_robots.py
 benchmark_results/
 *_subject*.csv
+*_subject*.npz
 *.pkl
+eval_*.csv
 
 # Documentation outputs.
 **/_build/*

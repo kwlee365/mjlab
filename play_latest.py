@@ -242,6 +242,14 @@ class Config:
   num_envs: int | None = None
   device: str | None = None
   viewer: Literal["auto", "native", "viser"] = "auto"
+  episode_length_s: float | None = None
+  """Reset each env after this many seconds. Play mode defaults to effectively
+  infinite (each clip plays start-to-end). Set e.g. 10 to play fixed-length
+  windows and cycle through motions faster."""
+  sampling_mode: Literal["start", "uniform", "adaptive"] | None = None
+  """Motion start-frame sampling on reset. Play mode defaults to 'start' (clip
+  beginning); 'uniform' picks a random start frame within the clip. Combine with
+  --episode-length-s 10 to play random 10s windows (like training)."""
 
 
 def run(task_id: str, cfg: Config) -> None:
@@ -288,10 +296,17 @@ def run(task_id: str, cfg: Config) -> None:
     # single-element list identically to a single motion_file (num_clips == 1).
     motion_cmd.motion_files = tuple(motion_files)
     motion_cmd.motion_file = ""
+    if cfg.sampling_mode is not None:
+      motion_cmd.sampling_mode = cfg.sampling_mode
+      print(f"[play_latest] sampling_mode: {cfg.sampling_mode}")
     if len(motion_files) == 1:
       print(f"[play_latest] motion: {motion_files[0]}")
     else:
       print(f"[play_latest] motion: {len(motion_files)} clips (multi-clip)")
+
+  if cfg.episode_length_s is not None:
+    env_cfg.episode_length_s = cfg.episode_length_s
+    print(f"[play_latest] episode_length_s: {cfg.episode_length_s}")
 
   if cfg.num_envs is not None:
     env_cfg.scene.num_envs = cfg.num_envs
